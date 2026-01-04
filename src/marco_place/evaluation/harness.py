@@ -178,11 +178,26 @@ class EvaluationHarness:
             signal.alarm(self.timeout_seconds)
 
             try:
-                placement = placer.place(circuit_data)
+                result_placement = placer.place(circuit_data)
                 runtime = time.time() - start_time
 
                 # Cancel alarm
                 signal.alarm(0)
+
+                # Handle flexible return type
+                # placer.place() can return either:
+                #   - single tensor: macro_placement only
+                #   - tuple: (macro_placement, cell_placement)
+                if isinstance(result_placement, tuple):
+                    macro_placement, cell_placement = result_placement
+                    if verbose:
+                        has_cells = cell_placement is not None
+                        print(f"✓ Completed in {runtime:.2f}s (placed {'macros + cells' if has_cells else 'macros only'})")
+                else:
+                    macro_placement = result_placement
+                    cell_placement = None
+                    if verbose:
+                        print(f"✓ Completed in {runtime:.2f}s (placed macros only)")
 
             except TimeoutException:
                 if verbose:
@@ -192,15 +207,14 @@ class EvaluationHarness:
                 return result
 
             result['runtime'] = runtime
-            if verbose:
-                print(f"✓ Completed in {runtime:.2f}s")
+            result['placed_cells'] = cell_placement is not None
 
-            # Validate placement
+            # Validate placement (macro placement is primary validation target)
             if verbose:
-                print("Validating placement...")
+                print("Validating macro placement...")
 
             validator = PlacementValidator(circuit_data)
-            is_valid, violations = validator.validate(placement)
+            is_valid, violations = validator.validate(macro_placement)
 
             result['valid'] = is_valid
 
@@ -215,11 +229,11 @@ class EvaluationHarness:
             if verbose:
                 print("✓ Placement is valid")
 
-            # Compute metrics
+            # Compute metrics (on macro placement)
             if verbose:
                 print("Computing metrics...")
 
-            costs = compute_proxy_cost(placement, circuit_data)
+            costs = compute_proxy_cost(macro_placement, circuit_data)
             result.update(costs)
 
             if verbose:

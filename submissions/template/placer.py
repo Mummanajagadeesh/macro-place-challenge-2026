@@ -33,98 +33,61 @@ class BasePlacerInterface(ABC):
     """
 
     @abstractmethod
-    def place(self, circuit_data: CircuitTensorData) -> torch.Tensor:
+    def place(self, circuit_data: CircuitTensorData):
         """
-        Compute macro placement for the given circuit.
+        Compute placement for the given circuit.
 
         Args:
             circuit_data: CircuitTensorData object containing:
-                - metadata: dict with design_name, num_macros, canvas_width, canvas_height
+                - metadata: dict with design_name, num_macros, num_stdcells, canvas dimensions
                 - macro_sizes: [num_macros, 2] tensor of (width, height)
+                - stdcell_sizes: [num_stdcells, 2] tensor of (width, height) [OPTIONAL]
                 - net_to_nodes: list of tensors containing node indices for each net
                 - net_weights: [num_nets] tensor of net weights
                 - Other optional fields (see tensor_schema.py for full specification)
 
         Returns:
-            placement: torch.Tensor of shape [num_macros, 2]
-                      containing (x, y) coordinates of macro centers in microns
+            One of:
+            1. macro_placement: torch.Tensor [num_macros, 2] - if only placing macros
+            2. (macro_placement, cell_placement): tuple of tensors - if placing both
+               - macro_placement: [num_macros, 2]
+               - cell_placement: [num_stdcells, 2] or None
 
         Constraints:
-        - Placement must be within canvas boundaries:
-          0 <= x - width/2 and x + width/2 <= canvas_width
-          0 <= y - height/2 and y + height/2 <= canvas_height
-
-        - Macros must not overlap:
-          No two macros can have overlapping areas
-
-        - Must respect placement blockages (if present):
-          Macros cannot be placed in blockage regions
-
-        - Runtime limit:
-          Must complete within 1 hour (3600 seconds) per benchmark
+        - Placements must be within canvas boundaries
+        - No overlaps between macros
+        - No overlaps between macros and cells
+        - Runtime limit: 1 hour (3600 seconds) per benchmark
 
         Notes:
-        - You may use any PyTorch-based approach (GNN, RL, optimization, etc.)
-        - Pre-trained models are allowed if included in submission
-        - You have access to all circuit_data fields for your algorithm
-        - The evaluation harness will validate your placement and compute metrics
-        - Invalid placements will receive a score of 0 for that benchmark
+        - You can place only macros (return single tensor)
+        - Or place both macros and cells (return tuple)
+        - If you don't place cells, they keep initial positions
+        - Standard cells are pre-clustered (typically 800-1000 clusters per design)
 
-        Example:
+        Examples:
+            >>> # Option 1: Macro-only placement
             >>> def place(self, circuit_data):
-            >>>     num_macros = circuit_data.num_macros
-            >>>     canvas_width = circuit_data.canvas_width
-            >>>     canvas_height = circuit_data.canvas_height
-            >>>
-            >>>     # Your algorithm here
-            >>>     placement = your_algorithm(circuit_data)
-            >>>
-            >>>     return placement  # [num_macros, 2] tensor
+            >>>     macro_placement = your_macro_algorithm(circuit_data)
+            >>>     return macro_placement  # [num_macros, 2]
+
+            >>> # Option 2: Place both (single-stage)
+            >>> def place(self, circuit_data):
+            >>>     macro_placement, cell_placement = your_joint_algorithm(circuit_data)
+            >>>     return macro_placement, cell_placement
+
+            >>> # Option 3: Place both (two-stage internally)
+            >>> def place(self, circuit_data):
+            >>>     macro_placement = place_macros_first(circuit_data)
+            >>>     cell_placement = place_cells_around_macros(circuit_data, macro_placement)
+            >>>     return macro_placement, cell_placement
+
+            >>> # Option 4: Macro-only (explicit)
+            >>> def place(self, circuit_data):
+            >>>     macro_placement = your_macro_algorithm(circuit_data)
+            >>>     return macro_placement, None  # None = don't place cells
         """
         pass
-
-    def place_cells(
-        self,
-        circuit_data: CircuitTensorData,
-        macro_placement: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute standard cell placement given fixed macro positions (OPTIONAL).
-
-        This method is optional. If not implemented, only macros will be placed.
-        For two-stage placement, implement this method to place standard cells
-        after macros have been fixed.
-
-        Args:
-            circuit_data: CircuitTensorData object with design information
-            macro_placement: [num_macros, 2] tensor of fixed macro positions
-
-        Returns:
-            cell_placement: torch.Tensor of shape [num_stdcells, 2]
-                          containing (x, y) coordinates of cell centers in microns
-
-        Constraints:
-        - Same constraints as macro placement (no overlaps, within boundaries)
-        - Cells must not overlap with fixed macros
-        - Runtime is included in the total 1-hour timeout
-
-        Notes:
-        - Standard cells are typically clustered (800-1000 clusters per design)
-        - You can use coarse placement (cells don't need detailed legalization)
-        - If not implemented, cells will keep their initial positions
-
-        Example:
-            >>> def place_cells(self, circuit_data, macro_placement):
-            >>>     num_cells = circuit_data.num_stdcells
-            >>>     # Place cells in remaining space
-            >>>     cell_placement = your_cell_placement_algorithm(
-            >>>         circuit_data, macro_placement
-            >>>     )
-            >>>     return cell_placement  # [num_stdcells, 2] tensor
-        """
-        # Default: return None to indicate cells are not placed
-        # Evaluation will use initial cell positions if None is returned
-        return None
 
 
 class TemplatePlacer(BasePlacerInterface):

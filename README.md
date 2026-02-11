@@ -32,13 +32,15 @@ for Macro Placement]([https://arxiv.org/pdf/2302.11014](https://ieeexplore.ieee.
 - **$10,000 — First Place (Alternate):** Awarded if the winning submission ranks first overall but does **not** exceed the SA and RePlAce benchmark results.  
 - **$5,000 — Second Place:** Awarded to the runner-up based on final competition rankings.  
 - **$4,000 — Innovation Award:** Granted to the most creative or technically innovative approach among the top entries, as determined by the judging panel.
-
+- **Swag:** Every valid submission gets HRT swag!
+- 
 ## Submission Format
 
 - All submissions will be via google form. Submissions may be made public or private before the end of judging.
 - Private submissions will be required to share repository with judges so they may clone/evaluate the method.
 - Teams may be up to 5 individuals.
 - The deadline for submissions is 10 weeks from the posting of the competition at 11:59PM PT WILL INSERT DEADLINE DATE.
+- All teams may only submit one algorithm and one person may only join one team. 
 - **All winning implementations must be made open-source under Apache 2.0 or GPL**
 
 

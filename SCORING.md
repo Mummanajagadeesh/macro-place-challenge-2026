@@ -71,9 +71,9 @@ TNS_sub ≥ min(TNS_SA, TNS_RP)
 
 All feasible submissions are ranked using a **single scalar score** computed from improvement ratios. This approach:
 
-- Requires no arbitrary weights
 - Naturally handles metrics on different scales
-- Rewards **balanced improvement** across all three metrics
+- Prioritizes timing improvement (WNS most, then TNS) while keeping Area in the score
+- Uses a **weighted geometric mean** with fixed weights **(WNS:3, TNS:2, Area:1)** reflecting the relative importance of each metric in the final design
 
 ### Step 1 — Compute Average Baselines
 
@@ -97,13 +97,21 @@ R_Area = Area_avg / Area_sub      (lower area is better, so invert)
 
 ### Step 3 — Compute Per-Design Score
 
+Using a **weighted geometric mean** with weights (WNS:3, TNS:2, Area:1):
+
 ```
-Design_Score = (R_WNS × R_TNS × R_Area) ^ (1/3)
+Design_Score = (R_WNS^3 × R_TNS^2 × R_Area^1) ^ (1/6)
 ```
 
 - **Score > 1.0** → better than average baseline
 - **Score = 1.0** → matched baseline exactly
 - **Score < 1.0** → worse than average baseline
+
+### Why these weights?
+
+WNS is the single most important objective — a chip that fails its worst-case path fails, regardless of average behavior or area. TNS captures the breadth of timing violations and is next most important. Area matters but is secondary to timing closure at this stage of the flow. The 3:2:1 ratio reflects this ordering without zeroing out any metric.
+
+In log terms, a **1% improvement in WNS** contributes 3× as much to the score as a 1% improvement in Area, and 1.5× as much as a 1% improvement in TNS.
 
 ### Step 4 — Compute Total Score
 
@@ -142,10 +150,13 @@ R_WNS  = -1.3 / -0.8  = 1.625   (62.5% better WNS)
 R_TNS  = -10000 / -6000 = 1.667  (66.7% better TNS)
 R_Area = 4200000 / 4000000 = 1.05 (5% smaller area)
 
-Design_Score = (1.625 × 1.667 × 1.05) ^ (1/3) = (2.844) ^ (1/3) = 1.417
+Design_Score = (1.625^3 × 1.667^2 × 1.05^1) ^ (1/6)
+             = (4.291 × 2.779 × 1.05) ^ (1/6)
+             = (12.521) ^ (1/6)
+             = 1.524
 ```
 
-This submission scores **1.417** on ariane133 — roughly 42% better than the average baseline across all three metrics.
+This submission scores **1.524** on ariane133 — roughly 52% better than the average baseline, with WNS and TNS gains emphasized by the (3,2,1) weighting. Under equal (1,1,1) weighting the same submission would have scored 1.417.
 
 ---
 
@@ -161,8 +172,10 @@ If two submissions have identical Total Scores:
 
 ## Edge Cases
 
-- **WNS or TNS = 0.0 for both baselines**: If both baselines achieve zero slack on a design, that metric's ratio is excluded from the geometric mean for that design (reduces to 2 metrics).
-- **Submission achieves WNS/TNS = 0.0**: Capped at the best possible ratio (baseline / -0.001) to avoid division by zero.
+- **Submission achieves WNS = 0 and TNS = 0**: The clock period is tightened (frequency raised) and the design is re-evaluated, iteratively, until WNS < 0 reappears. Ranking then uses the WNS/TNS measured at that tighter clock. This ensures that submissions which close timing at the nominal clock are still differentiable on *how much frequency headroom* they provide, rather than being capped at a ceiling.
+  - The tightening schedule is fixed in advance (e.g., reduce period by 5% each step, up to a bounded number of steps) and applied identically to all submissions for that design.
+  - Baselines are re-evaluated at the tightened clock only if at least one baseline also reached zero-slack at the nominal clock; otherwise the original baseline numbers are used.
+- **WNS or TNS = 0.0 for both baselines (but submission has violations)**: That metric's ratio is excluded from the geometric mean for that design; the weights of the remaining metrics are renormalized so they still sum to 6.
 
 ---
 
@@ -190,6 +203,6 @@ To win the Grand Prize:
 
 1. Be in the **top 7 by proxy cost** (Tier 1)
 2. **Pass feasibility** — don't regress timing below both baselines on any design
-3. **Maximize your geometric mean score** — balanced improvement across WNS, TNS, and Area on all designs
+3. **Maximize your weighted geometric mean score** — prioritize WNS, then TNS, then Area (weights 3:2:1) across all designs
 
 This is a **strictly rules-based system**. There is **no subjective judgment** in ranking.

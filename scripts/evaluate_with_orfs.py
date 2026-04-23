@@ -306,6 +306,68 @@ def evaluate_benchmark(
     else:
         orfs_config_dir = Path(f"external/MacroPlacement/Flows/ASAP7/{source_name}/scripts/OpenROAD/{source_name}")
 
+    # Extract .tar.gz configs (ariane136, mempool_tile ship as tarballs)
+    if not orfs_config_dir.exists():
+        import tarfile
+        tar_parent = orfs_config_dir.parent
+        for tar_path in tar_parent.glob("*.tar.gz") if tar_parent.exists() else []:
+            print(f"  Extracting {tar_path.name}...")
+            with tarfile.open(tar_path) as tar:
+                # Find config.mk inside the tar (may be nested)
+                config_members = [m for m in tar.getmembers() if m.name.endswith("config.mk")]
+                if config_members:
+                    orfs_config_dir.mkdir(parents=True, exist_ok=True)
+                    # Extract all files, stripping the leading path to get just filenames
+                    for member in tar.getmembers():
+                        if member.isfile():
+                            member_name = Path(member.name).name
+                            member.name = member_name
+                            tar.extract(member, orfs_config_dir)
+                    print(f"  ✓ Extracted {len(tar.getmembers())} files to {orfs_config_dir}")
+                    break
+
+    # Generate ORFS config for nvdla if it doesn't exist (no upstream collateral)
+    if not orfs_config_dir.exists() and source_name == "nvdla":
+        orfs_config_dir.mkdir(parents=True, exist_ok=True)
+        enable_dir = Path("external/MacroPlacement/Enablements/NanGate45")
+        netlist_dir = Path(f"external/MacroPlacement/Flows/NanGate45/nvdla/netlist")
+
+        # Copy Genus netlist and fakeram files
+        shutil.copy(netlist_dir / "NV_NVDLA_partition_c.v", orfs_config_dir)
+        shutil.copy(enable_dir / "lef" / "fakeram45_256x64.lef", orfs_config_dir)
+        shutil.copy(enable_dir / "lib" / "fakeram45_256x64.lib", orfs_config_dir)
+
+        # Write config.mk
+        (orfs_config_dir / "config.mk").write_text("""\
+export DESIGN_NICKNAME = nvdla
+export DESIGN_NAME = NV_nvdla
+export PLATFORM    = nangate45
+
+export VERILOG_FILES = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/NV_NVDLA_partition_c.v
+
+export SDC_FILE      = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/constraint.sdc
+export ABC_CLOCK_PERIOD_IN_PS = 2000
+
+export ADDITIONAL_LEFS = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/fakeram45_256x64.lef
+export ADDITIONAL_LIBS = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/fakeram45_256x64.lib
+
+export DIE_AREA    = 0.0 0.0 3200.00 3200.00
+export CORE_AREA   = 10.07 9.94 3189.93 3190.06
+export PLACE_PINS_ARGS = -exclude left:0-400 -exclude left:2800-3200 \\
+                         -exclude right:0-400 -exclude right:2800-3200 \\
+                         -exclude top:0-400 -exclude top:2800-3200 \\
+                         -exclude bottom:0-400 -exclude bottom:2800-3200
+
+export PLACE_DENSITY_LB_ADDON ?= 0.10
+""")
+        # Write constraint.sdc (4ns clock matching other NG45 benchmarks)
+        (orfs_config_dir / "constraint.sdc").write_text("""\
+create_clock [get_ports nvdla_core_clk]  -name core_clock  -period 4
+set_input_delay -clock core_clock 0 [all_inputs]
+set_output_delay -clock core_clock 0 [all_outputs]
+""")
+        print(f"  ✓ Generated ORFS config for nvdla (128 macros, fakeram45_256x64)")
+
     # Fallback: check ORFS built-in designs (maps source_name to ORFS design name)
     orfs_builtin_map = {
         'bp_quad': 'black_parrot',
@@ -359,6 +421,31 @@ def evaluate_benchmark(
         if config_mk.exists():
             config_content = config_mk.read_text()
 
+            # Use pre-mapped Genus gate netlist when available (bypasses Yosys).
+            # This fixes ariane133 where PRESERVE_CELLS causes Yosys to drop
+            # 89 of 133 SRAMs (see issue #50).
+            _using_genus_netlist = False
+            genus_netlist_dir = Path(
+                f"external/MacroPlacement/Flows/NanGate45/{source_name}/netlist"
+            )
+            if genus_netlist_dir.exists():
+                for candidate in sorted(genus_netlist_dir.glob("*.v")):
+                    with open(candidate) as fv:
+                        n_sram = sum(1 for line in fv if "fakeram45_" in line)
+                    if n_sram > 0:
+                        abs_path = candidate.resolve()
+                        config_content += (
+                            f"\n# Override: use Genus-mapped gate netlist ({n_sram} SRAMs)\n"
+                            f"export SYNTH_NETLIST_FILES = {abs_path}\n"
+                        )
+                        # Remove stale Yosys cache so ORFS uses the Genus netlist
+                        stale_yosys = orfs_root / "flow" / "results" / tech / source_name / "base" / "1_2_yosys.v"
+                        if stale_yosys.is_file():
+                            stale_yosys.unlink()
+                        _using_genus_netlist = True
+                        print(f"  ✓ Using Genus gate netlist: {candidate.name} ({n_sram} SRAMs)")
+                        break
+
             if source_name == "mempool_tile":
                 # 1. Disable hierarchical flow
                 config_content = re.sub(
@@ -411,17 +498,17 @@ def evaluate_benchmark(
                 )
                 print(f"  ✓ Fixed mempool_tile config (disabled hierarchical flow, increased die to 2000x2000, opened all pin sides)")
 
-            if source_name == "ariane136":
-                # Reduce macro halo so 136 macros can be clustered (default 22.4x15.12 is too large)
+            if source_name in ("ariane133", "ariane136"):
+                # Reduce macro halo so macros fit (default 22.4x15.12 is too large for 133+ macros)
                 if 'MACRO_PLACE_HALO' not in config_content:
-                    config_content += '\nexport MACRO_PLACE_HALO = 11.2 7.56\n'
+                    config_content += '\nexport MACRO_PLACE_HALO = 5.0 5.0\n'
                 else:
                     config_content = re.sub(
                         r'export MACRO_PLACE_HALO\s*=.*',
-                        'export MACRO_PLACE_HALO = 11.2 7.56',
+                        'export MACRO_PLACE_HALO = 5.0 5.0',
                         config_content
                     )
-                print(f"  ✓ Reduced ariane136 MACRO_PLACE_HALO to 11.2 7.56 (from default 22.4 15.12)")
+                print(f"  ✓ Reduced {source_name} MACRO_PLACE_HALO to 5.0 5.0")
 
             if source_name == "black_parrot":
                 # Disable hierarchical synthesis — we use our own macro placement
@@ -476,24 +563,38 @@ def evaluate_benchmark(
             mp_util.write_text(mp_util_text)
             print(f"  ✓ Patched macro_place_util.tcl to support SKIP_RTLMP")
 
-        # Set SKIP_RTLMP in config
+        # Parse CORE_AREA from config.mk
+        core_area = None
         config_mk = design_dir / "config.mk"
         config_text = config_mk.read_text()
-        if 'SKIP_RTLMP' not in config_text:
-            config_text += '\nexport SKIP_RTLMP = 1\n'
-            config_mk.write_text(config_text)
-        print(f"  ✓ Set SKIP_RTLMP=1 in config")
-
-        # Parse CORE_AREA from config.mk and regenerate TCL with clamping
-        core_area = None
-        config_text = (design_dir / "config.mk").read_text()
         m = re.search(r'CORE_AREA\s*=\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)', config_text)
         if m:
             core_area = tuple(float(x) for x in m.groups())
             print(f"  ✓ Parsed CORE_AREA: {core_area}")
 
+        # Set SKIP_RTLMP in config (only when we're providing our own placement)
+        if placement_path is not None and 'SKIP_RTLMP' not in config_text:
+            config_text += '\nexport SKIP_RTLMP = 1\n'
+            config_mk.write_text(config_text)
+            print(f"  ✓ Set SKIP_RTLMP=1 in config")
+        elif placement_path is None:
+            # No custom placement — let ORFS's rtl_macro_placer handle it (baseline mode)
+            # Remove MACRO_PLACEMENT_TCL so ORFS does its own placement
+            config_text = re.sub(r'\nexport MACRO_PLACEMENT_TCL\s*=.*\n', '\n', config_text)
+            # Set RTLMP fence to core area so rtl_macro_placer knows the bounds
+            if core_area and 'RTLMP_FENCE' not in config_text:
+                config_text += (
+                    f'\n# rtl_macro_placer fence bounds (= CORE_AREA)\n'
+                    f'export RTLMP_FENCE_LX = {core_area[0]}\n'
+                    f'export RTLMP_FENCE_LY = {core_area[1]}\n'
+                    f'export RTLMP_FENCE_UX = {core_area[2]}\n'
+                    f'export RTLMP_FENCE_UY = {core_area[3]}\n'
+                )
+            config_mk.write_text(config_text)
+            print(f"  ✓ Baseline mode: letting ORFS rtl_macro_placer handle placement")
+
         # Regenerate TCL with core_area clamping
-        write_orfs_macro_placement(placement, benchmark, plc, str(tcl_file), core_area=core_area)
+        write_orfs_macro_placement(placement, benchmark, plc, str(tcl_file), core_area=core_area, use_genus_names=_using_genus_netlist)
         shutil.copy(tcl_file, design_dir / "macros.tcl")
         # Also overwrite any existing macro placement TCL referenced in config
         tcl_ref = re.search(r'MACRO_PLACEMENT_TCL\s*=.*?/([^/\s]+\.tcl)', config_text)

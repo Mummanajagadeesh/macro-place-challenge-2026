@@ -1,28 +1,26 @@
 """
-MJ97 v9 — Grid-Aligned GP + Fast Congestion Refinement
+MJ97 v10 — Vectorized Numpy GP, Strict Time Control
 
-Key fixes over v8:
-1. GRID-ALIGNED DENSITY: Use benchmark.grid_rows/cols for the FFT density
-   grid instead of fixed 32×32. This is the #1 fix — when the evaluation
-   grid is 30×27 (ibm02) and we spread on 32×32, the density signal is
-   misaligned and post-legalization congestion blows up.
+Root cause of v8/v9 failure:
+1. _wa_wl_grad iterates over nets in Python — with 7k-16k nets × 600 iters,
+   this takes 200-400s regardless of budget. Budget is checked between iters
+   but each iter itself is slow.
+2. ibm02 cong=2.336 unchanged across v4/v8/v9 — the congestion evaluator
+   smooth range=2 on 30×27 grid means net bounding boxes need to be tight,
+   not just macros spread. Need stronger WL optimization.
 
-2. KILL plc.get_congestion_cost() LOOP: The real-congestion escape in v8
-   burns 10s+ doing slow Python API calls per move. Removed entirely.
-   Replace with fast RUDY-guided escape using pure numpy — same idea,
-   100x faster.
+Fixes:
+1. Fully vectorized WA gradient using numpy segment ops (no per-net Python loop)
+   — uses np.maximum.reduceat / np.add.at with precomputed CSR structure
+   — each gradient call: O(E) where E=total net pins, no Python loop
+   — 10-50x speedup → can do 2000+ iters in 20s
 
-3. TWO-PHASE GP: After legalization, run a short second GP pass (5-8s)
-   with tight density to re-spread macros that got clustered by legalization.
-   This is the main quality lever — legalization undoes GP spreading, so
-   we re-spread and re-legalize.
+2. Strict per-iteration time check so budget is actually respected
 
-4. STRICT 55s HARD CAP per benchmark (eval machine may be slower than ours)
+3. ibm02 fix: stronger gamma decay (tighter WA → closer to true HPWL) and
+   higher lambda → forces macros to actually minimize net bounding boxes
 
-5. NESTEROV with stable LR: Fixed base LR from bin size, simple momentum
-   without the unstable Lipschitz estimation that was causing LR collapse.
-
-Expected: avg ~1.35-1.40, runtime ~50-55s/bench → well within 1hr limit
+4. Runtime target: 40s per benchmark (budget for eval machine slowdown)
 """
 
 import math
@@ -36,14 +34,14 @@ import torch
 
 from macro_place.benchmark import Benchmark
 
-HARD_CAP = 55.0  # seconds per benchmark, hard limit
+HARD_CAP = 50.0  # seconds hard limit per benchmark
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Loader
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_plc(benchmark: Benchmark):
+def _load_plc(benchmark):
     bench_name = benchmark.name
     candidates = [
         f"external/MacroPlacement/Testcases/ICCAD04/{bench_name}",
@@ -62,7 +60,7 @@ def _load_plc(benchmark: Benchmark):
     return None
 
 
-def _extract_nets(benchmark: Benchmark, plc) -> List[List[int]]:
+def _extract_nets(benchmark, plc):
     name2idx = {name: i for i, name in enumerate(benchmark.macro_names)}
     nets = []
     try:
@@ -83,19 +81,23 @@ def _extract_nets(benchmark: Benchmark, plc) -> List[List[int]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Net index (CSR)
+# Net structure — CSR + per-node reverse index
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NetIndex:
     def __init__(self, nets: List[List[int]], n_nodes: int):
         self.n_nets = len(nets)
         self.n_nodes = n_nodes
+
+        # Forward: net → nodes
         offsets = [0]; flat = []
         for net in nets:
             flat.extend(net); offsets.append(len(flat))
         self.flat = np.array(flat, dtype=np.int32)
         self.offsets = np.array(offsets, dtype=np.int32)
+        self.net_sizes = np.diff(self.offsets)
 
+        # Reverse: node → nets
         node_nets: List[List[int]] = [[] for _ in range(n_nodes)]
         for ni, net in enumerate(nets):
             for node in net:
@@ -107,11 +109,10 @@ class NetIndex:
         self.nn_offsets = np.array(nn_offsets, dtype=np.int32)
 
     def hpwl_node(self, pos: np.ndarray, node: int) -> float:
-        x = pos[:, 0]; y = pos[:, 1]
-        total = 0.0
+        x = pos[:, 0]; y = pos[:, 1]; total = 0.0
         for ni in self.nn_flat[self.nn_offsets[node]:self.nn_offsets[node+1]]:
             idx = self.flat[self.offsets[ni]:self.offsets[ni+1]]
-            total += x[idx].max() - x[idx].min() + y[idx].max() - y[idx].min()
+            total += x[idx].max()-x[idx].min()+y[idx].max()-y[idx].min()
         return total
 
     def hpwl_nodes(self, pos: np.ndarray, i: int, j: int) -> float:
@@ -121,37 +122,77 @@ class NetIndex:
         total = 0.0
         for ni in si | sj:
             idx = self.flat[self.offsets[ni]:self.offsets[ni+1]]
-            total += x[idx].max() - x[idx].min() + y[idx].max() - y[idx].min()
+            total += x[idx].max()-x[idx].min()+y[idx].max()-y[idx].min()
         return total
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WA wirelength + gradient
+# VECTORIZED WA wirelength + gradient
+#
+# Key: no per-net Python loop. Uses np.maximum.reduceat and np.add.at
+# over the flat CSR arrays. All net operations are single numpy calls.
+#
+# For each net (dimension d):
+#   vmax = max(pos[idx, d])     <- np.maximum.reduceat(pos[flat,d], offsets)
+#   ep[i] = exp(clip((v[i]-vmax)/gamma, -30, 0))
+#   sp = sum(ep)
+#   wp = sum(v*ep)/sp           <- numerically stable WA max
+#   grad contribution: ep/sp*(1+(v-wp)/gamma) - en/sn*(1-(v-wn)/gamma)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wa_wl_grad(pos: np.ndarray, ni: NetIndex, gamma: float) -> Tuple[float, np.ndarray]:
+def _wa_wl_grad_fast(pos: np.ndarray, ni: NetIndex, gamma: float):
+    """
+    Fully vectorized WA WL + gradient. No Python loop over nets.
+    Returns (total_wl, grad) where grad is (N,2).
+    """
     grad = np.zeros_like(pos)
     total = 0.0
-    for net_id in range(ni.n_nets):
-        o0 = ni.offsets[net_id]; o1 = ni.offsets[net_id+1]
-        if o1 - o0 < 2:
-            continue
-        idx = ni.flat[o0:o1]
-        for d in range(2):
-            v = pos[idx, d]
-            vm = v.max(); vn = v.min()
-            ep = np.exp(np.clip((v-vm)/gamma, -30, 0))
-            en = np.exp(np.clip(-(v-vn)/gamma, -30, 0))
-            sp = ep.sum()+1e-12; sn = en.sum()+1e-12
-            wp = (v*ep).sum()/sp; wn = (v*en).sum()/sn
-            total += wp - wn
-            np.add.at(grad[:, d], idx,
-                      ep/sp*(1+(v-wp)/gamma) - en/sn*(1-(v-wn)/gamma))
+    flat = ni.flat; offsets = ni.offsets[:-1]  # start offsets for reduceat
+
+    for d in range(2):
+        v_flat = pos[ni.flat, d]  # values at all net pins, flat
+
+        # Max per net (for numerical stability)
+        vmax = np.maximum.reduceat(v_flat, offsets)  # (n_nets,)
+        # Min per net
+        vmin = np.minimum.reduceat(v_flat, offsets)  # (n_nets,)
+
+        # Broadcast: repeat vmax/vmin to flat length
+        # net_id[k] = net that flat pin k belongs to
+        net_id = np.repeat(np.arange(ni.n_nets), ni.net_sizes)  # (E,)
+
+        vmax_flat = vmax[net_id]  # (E,)
+        vmin_flat = vmin[net_id]  # (E,)
+
+        ep = np.exp(np.clip((v_flat - vmax_flat) / gamma, -30, 0))  # (E,)
+        en = np.exp(np.clip(-(v_flat - vmin_flat) / gamma, -30, 0))  # (E,)
+
+        sp = np.add.reduceat(ep, offsets) + 1e-12  # (n_nets,)
+        sn = np.add.reduceat(en, offsets) + 1e-12  # (n_nets,)
+
+        # WA positions
+        vep = np.add.reduceat(v_flat * ep, offsets)  # (n_nets,)
+        ven = np.add.reduceat(v_flat * en, offsets)  # (n_nets,)
+        wp = vep / sp   # (n_nets,)
+        wn = ven / sn   # (n_nets,)
+
+        total += (wp - wn).sum()
+
+        # Gradient per pin
+        sp_flat = sp[net_id]; sn_flat = sn[net_id]
+        wp_flat = wp[net_id]; wn_flat = wn[net_id]
+
+        g_flat = (ep / sp_flat * (1 + (v_flat - wp_flat) / gamma)
+                  - en / sn_flat * (1 - (v_flat - wn_flat) / gamma))
+
+        # Scatter back to nodes
+        np.add.at(grad[:, d], ni.flat, g_flat)
+
     return total, grad
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Bell kernel
+# Bell kernel (same as before)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _bell(u, s):
@@ -170,36 +211,21 @@ def _dbell(u, s):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FFT density — GRID-ALIGNED (use actual evaluation grid dims)
-# This is the critical fix: ibm02 has 30×27 grid, not 32×32.
-# Spreading on wrong grid = density signal completely misaligned.
+# FFT density — grid-aligned (uses actual R×C evaluation grid)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _density_fft(pos, sizes, canvas_w, canvas_h, R, C, target=0.7):
-    """
-    FFT electrostatic density on R×C grid matching the actual evaluation grid.
-    target < 1.0 forces spreading; 0.6 is aggressive, 0.8 is moderate.
-    """
+def _density_fft(pos, sizes, canvas_w, canvas_h, R, C, target=0.65):
     bh = canvas_h/R; bw = canvas_w/C
     bx = (np.arange(C)+0.5)*bw; by = (np.arange(R)+0.5)*bh
-
-    # Spread radius: at least 1.5 bins
     sx = np.maximum(sizes[:,0:1], 1.5*bw)
     sy = np.maximum(sizes[:,1:2], 1.5*bh)
-
-    dx = pos[:,0:1]-bx[None,:]   # (N, C)
-    dy = pos[:,1:2]-by[None,:]   # (N, R)
-    wx = _bell(dx, sx)            # (N, C)
-    wy = _bell(dy, sy)            # (N, R)
-
-    area = sizes[:,0]*sizes[:,1]
-    w_area = area/(bw*bh)
-
-    rho = (w_area[:,None]*wy).T @ wx   # (R, C)
+    dx = pos[:,0:1]-bx[None,:]; dy = pos[:,1:2]-by[None,:]
+    wx = _bell(dx, sx); wy = _bell(dy, sy)
+    area = sizes[:,0]*sizes[:,1]; w_area = area/(bw*bh)
+    rho = (w_area[:,None]*wy).T @ wx
     ovf = np.maximum(0.0, rho-target)
     penalty = 0.5*(ovf**2).sum()
 
-    # Poisson solve
     ovf_t = torch.from_numpy(ovf.astype(np.float32))
     R2, C2 = R*2, C*2
     ext = torch.zeros(R2, C2)
@@ -225,47 +251,40 @@ def _density_fft(pos, sizes, canvas_w, canvas_h, R, C, target=0.7):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global placement — Nesterov with stable LR
+# Global placement — Nesterov, vectorized gradient, strict time control
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _global_place(init, movable, sizes, ni, canvas_w, canvas_h, R, C,
-                  time_budget=20.0, seed=97, density_target=0.65,
+                  t_start, time_budget,
+                  seed=97, density_target=0.65,
                   gamma0_frac=0.05, gamma_min_frac=0.0005,
-                  lam0=1e-3, lam_max=4.0):
+                  lam0=5e-4, lam_max=5.0, momentum=0.9):
     np.random.seed(seed)
-    t0 = time.time()
     hw = sizes[:,0]*0.5; hh = sizes[:,1]*0.5
     diag = math.sqrt(canvas_w**2+canvas_h**2)
-
     gamma0    = diag * gamma0_frac
     gamma_min = diag * gamma_min_frac
-
-    # Stable base LR: bin size / 2
-    bin_size = min(canvas_w/C, canvas_h/R)
-    lr = bin_size * 0.4
+    bin_size  = min(canvas_w/C, canvas_h/R)
+    lr        = bin_size * 0.35
 
     pos = init.copy()
     pos[:,0] = np.clip(pos[:,0], hw, canvas_w-hw)
     pos[:,1] = np.clip(pos[:,1], hh, canvas_h-hh)
 
-    # Nesterov state
     v = np.zeros_like(pos)
-    momentum = 0.9
-
     best_pos = pos.copy(); best_cost = float('inf')
-    it = 0; max_iter = 600
+    it = 0; deadline = t_start + time_budget
 
-    while it < max_iter and (time.time()-t0) < time_budget:
-        frac = it/max_iter
+    while time.time() < deadline:
+        frac = min(1.0, (time.time()-t_start)/time_budget)
         gamma = gamma0 * math.exp(math.log(gamma_min/gamma0)*frac)
         lam   = lam0   * math.exp(math.log(lam_max/lam0)*frac)
 
-        # Nesterov lookahead
         x_look = pos + momentum*v
         x_look[:,0] = np.clip(x_look[:,0], hw, canvas_w-hw)
         x_look[:,1] = np.clip(x_look[:,1], hh, canvas_h-hh)
 
-        wl, gwl = _wa_wl_grad(x_look, ni, gamma)
+        wl, gwl = _wa_wl_grad_fast(x_look, ni, gamma)
         dp, gdp = _density_fft(x_look, sizes, canvas_w, canvas_h, R, C, target=density_target)
 
         g = gwl + lam*gdp
@@ -278,9 +297,8 @@ def _global_place(init, movable, sizes, ni, canvas_w, canvas_h, R, C,
         pos[~movable] = init[~movable]
 
         cost = wl + lam*dp
-        if cost < best_cost and frac > 0.25:
+        if cost < best_cost and frac > 0.2:
             best_cost = cost; best_pos = pos.copy()
-
         it += 1
 
     best_pos[~movable] = init[~movable]
@@ -289,7 +307,6 @@ def _global_place(init, movable, sizes, ni, canvas_w, canvas_h, R, C,
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Legalization — spiral, largest-first, guaranteed zero overlaps
-# gap=0.003 gives a small buffer to avoid float-precision edge cases
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _legalize(init, movable, sizes, canvas_w, canvas_h, gap=0.003):
@@ -300,7 +317,6 @@ def _legalize(init, movable, sizes, canvas_w, canvas_h, gap=0.003):
     order = sorted(range(n), key=lambda i: -(sizes[i,0]*sizes[i,1]))
     placed = np.zeros(n, dtype=bool)
     legal = init.copy()
-    step_base = 0.15
 
     for idx in order:
         if not movable[idx]:
@@ -313,7 +329,7 @@ def _legalize(init, movable, sizes, canvas_w, canvas_h, gap=0.003):
             if not ((dx < sep_x[idx][pidx]+gap) & (dy < sep_y[idx][pidx]+gap)).any():
                 placed[idx] = True; continue
 
-        step = max(sizes[idx,0], sizes[idx,1]) * step_base
+        step = max(sizes[idx,0], sizes[idx,1]) * 0.15
         best = None; bdist = float('inf')
 
         for r in range(1, 400):
@@ -342,36 +358,30 @@ def _legalize(init, movable, sizes, canvas_w, canvas_h, gap=0.003):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RUDY congestion map (fast numpy, no per-net Python loop on gradient)
+# RUDY map (vectorized)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _rudy_map(pos, ni, canvas_w, canvas_h, R, C):
     bw = canvas_w/C; bh = canvas_h/R
-    demand = np.zeros((R, C), dtype=np.float64)
+    demand = np.zeros((R, C))
     x = pos[:,0]; y = pos[:,1]
     for nid in range(ni.n_nets):
         idx = ni.flat[ni.offsets[nid]:ni.offsets[nid+1]]
-        xi = x[idx]; yi = y[idx]
+        xi=x[idx]; yi=y[idx]
         x0=xi.min(); x1=xi.max(); y0=yi.min(); y1=yi.max()
-        nw=max(x1-x0,1e-8); nh=max(y1-y0,1e-8)
-        box=nw*nh
+        nw=max(x1-x0,1e-8); nh=max(y1-y0,1e-8); box=nw*nh
         r0=int(np.clip(y0/bh,0,R-1)); r1=int(np.clip(y1/bh,0,R-1))
         c0=int(np.clip(x0/bw,0,C-1)); c1=int(np.clip(x1/bw,0,C-1))
-        demand[r0:r1+1, c0:c1+1] += (nh/box+nw/box)*bw*bh*0.5
+        demand[r0:r1+1,c0:c1+1] += (nh/box+nw/box)*bw*bh*0.5
     return demand
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fast congestion escape — pure numpy, no plc API calls
-#
-# For each macro in a hot bin, try moving it to the best cooler bin
-# within a search radius. Accept if RUDY congestion drops AND WL doesn't
-# increase too much. Fast: no Python API calls, just array ops.
+# Congestion escape — RUDY-guided, fast numpy
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _congestion_escape(pos, movable, sizes, ni, canvas_w, canvas_h, R, C,
-                       gap=0.003, time_budget=8.0, radius=4):
-    t0 = time.time()
+                       t_start, time_budget, gap=0.003, radius=4):
     n = len(pos)
     bw = canvas_w/C; bh = canvas_h/R
     hw = sizes[:,0]/2; hh = sizes[:,1]/2
@@ -379,128 +389,92 @@ def _congestion_escape(pos, movable, sizes, ni, canvas_w, canvas_h, R, C,
     sep_y = (sizes[:,1:2]+sizes[:,1].reshape(1,n))/2.0
     movable_idx = np.where(movable)[0]
     diag = math.sqrt(canvas_w**2+canvas_h**2)
-
+    deadline = t_start + time_budget
     p = pos.copy()
 
-    # Iterative passes
-    for pass_i in range(8):
-        if time.time()-t0 >= time_budget:
-            break
-
+    for _ in range(10):
+        if time.time() >= deadline: break
         demand = _rudy_map(p, ni, canvas_w, canvas_h, R, C)
         thresh = np.percentile(demand, 85)
-        if thresh < 1e-6:
-            break
+        if thresh < 1e-6: break
 
-        # Sort hot macros by demand (hottest first)
-        hot = []
-        for idx in movable_idx:
-            r = int(np.clip(p[idx,1]/bh, 0, R-1))
-            c = int(np.clip(p[idx,0]/bw, 0, C-1))
-            if demand[r,c] >= thresh:
-                hot.append((demand[r,c], idx))
+        hot = [(demand[int(np.clip(p[idx,1]/bh,0,R-1)), int(np.clip(p[idx,0]/bw,0,C-1))], idx)
+               for idx in movable_idx
+               if demand[int(np.clip(p[idx,1]/bh,0,R-1)), int(np.clip(p[idx,0]/bw,0,C-1))] >= thresh]
         hot.sort(reverse=True)
 
         n_moved = 0
-        for _, idx in hot:
-            if time.time()-t0 >= time_budget:
-                break
-
+        for cur_d, idx in hot:
+            if time.time() >= deadline: break
             r_cur = int(np.clip(p[idx,1]/bh, 0, R-1))
             c_cur = int(np.clip(p[idx,0]/bw, 0, C-1))
-            cur_demand = demand[r_cur, c_cur]
-            wl_before = ni.hpwl_node(p, idx)
+            wl_b = ni.hpwl_node(p, idx)
             orig = p[idx].copy()
-
             best_score = -1e9; best_cand = None
 
             for dr in range(-radius, radius+1):
                 for dc in range(-radius, radius+1):
                     if dr==0 and dc==0: continue
-                    nr = int(np.clip(r_cur+dr, 0, R-1))
-                    nc = int(np.clip(c_cur+dc, 0, C-1))
-                    if demand[nr,nc] >= cur_demand:
-                        continue  # only try cooler bins
-
-                    tx = np.clip((nc+0.5)*bw, hw[idx], canvas_w-hw[idx])
-                    ty = np.clip((nr+0.5)*bh, hh[idx], canvas_h-hh[idx])
-
-                    # Legality check (vectorized)
-                    ddx = np.abs(tx-p[:,0]); ddy = np.abs(ty-p[:,1])
-                    ddx[idx] = 999; ddy[idx] = 999  # ignore self
-                    if ((ddx < sep_x[idx]+gap) & (ddy < sep_y[idx]+gap)).any():
-                        continue
-
-                    p[idx] = [tx, ty]
-                    wl_after = ni.hpwl_node(p, idx)
-                    p[idx] = orig
-
-                    wl_delta = wl_after - wl_before
-                    cong_gain = cur_demand - demand[nr,nc]
-
-                    # Score: congestion gain minus normalized WL penalty
-                    score = cong_gain - 0.3 * max(0, wl_delta) / (diag*0.01+1e-10)
-                    if score > best_score:
-                        best_score = score; best_cand = np.array([tx, ty])
+                    nr=int(np.clip(r_cur+dr,0,R-1)); nc=int(np.clip(c_cur+dc,0,C-1))
+                    if demand[nr,nc] >= cur_d: continue
+                    tx=np.clip((nc+0.5)*bw, hw[idx], canvas_w-hw[idx])
+                    ty=np.clip((nr+0.5)*bh, hh[idx], canvas_h-hh[idx])
+                    ddx=np.abs(tx-p[:,0]); ddy=np.abs(ty-p[:,1])
+                    ddx[idx]=999; ddy[idx]=999
+                    if ((ddx<sep_x[idx]+gap)&(ddy<sep_y[idx]+gap)).any(): continue
+                    p[idx]=[tx,ty]; wl_a=ni.hpwl_node(p,idx); p[idx]=orig
+                    score = (cur_d-demand[nr,nc]) - 0.3*max(0,wl_a-wl_b)/(diag*0.01+1e-10)
+                    if score > best_score: best_score=score; best_cand=np.array([tx,ty])
 
             if best_cand is not None and best_score > 0:
-                p[idx] = best_cand
-                n_moved += 1
+                p[idx]=best_cand; n_moved+=1
             else:
-                p[idx] = orig
-
-        if n_moved == 0:
-            break
-
+                p[idx]=orig
+        if n_moved == 0: break
     return p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HPWL swap refinement
+# Swap refinement
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _swap_refine(pos, movable, sizes, ni, canvas_w, canvas_h,
-                 gap=0.003, n_passes=6, time_budget=5.0, k=12):
-    t0 = time.time()
+                 t_start, time_budget, gap=0.003, k=12):
     n = len(pos)
     hw = sizes[:,0]/2; hh = sizes[:,1]/2
     sep_x = (sizes[:,0:1]+sizes[:,0].reshape(1,n))/2.0
     sep_y = (sizes[:,1:2]+sizes[:,1].reshape(1,n))/2.0
     movable_idx = np.where(movable)[0]
+    deadline = t_start + time_budget
+    p = pos.copy()
 
     def legal_swap(p, i, j):
         placed = np.ones(n, dtype=bool); placed[i]=False; placed[j]=False
-        for nd, np_ in [(i, p[j].copy()), (j, p[i].copy())]:
+        for nd, np_ in [(i,p[j].copy()), (j,p[i].copy())]:
             if not (hw[nd]<=np_[0]<=canvas_w-hw[nd] and hh[nd]<=np_[1]<=canvas_h-hh[nd]):
                 return False
             dx=np.abs(np_[0]-p[:,0]); dy=np.abs(np_[1]-p[:,1])
-            if ((dx<sep_x[nd]+gap)&(dy<sep_y[nd]+gap)&placed).any():
-                return False
-            placed[nd] = True
+            if ((dx<sep_x[nd]+gap)&(dy<sep_y[nd]+gap)&placed).any(): return False
+            placed[nd]=True
         return True
 
-    p = pos.copy()
-    for _ in range(n_passes):
-        if time.time()-t0 >= time_budget: break
+    while time.time() < deadline:
         improved = 0
         order = movable_idx.copy(); np.random.shuffle(order)
         for i in order:
-            if time.time()-t0 >= time_budget: break
+            if time.time() >= deadline: break
             dists = np.abs(p[i,0]-p[movable_idx,0])+np.abs(p[i,1]-p[movable_idx,1])
             neighbors = movable_idx[np.argsort(dists)[1:k+1]]
             best_gain = 1e-9; best_j = -1
             for j in neighbors:
-                wl_b = ni.hpwl_nodes(p, i, j)
-                p[i], p[j] = p[j].copy(), p[i].copy()
-                if legal_swap(p, i, j):
-                    wl_a = ni.hpwl_nodes(p, i, j)
-                    if wl_b-wl_a > best_gain:
-                        best_gain = wl_b-wl_a; best_j = j
-                    else:
-                        p[i], p[j] = p[j].copy(), p[i].copy()
-                else:
-                    p[i], p[j] = p[j].copy(), p[i].copy()
-            if best_j >= 0: improved += 1
+                wl_b = ni.hpwl_nodes(p,i,j)
+                p[i],p[j] = p[j].copy(),p[i].copy()
+                if legal_swap(p,i,j):
+                    wl_a = ni.hpwl_nodes(p,i,j)
+                    if wl_b-wl_a > best_gain: best_gain=wl_b-wl_a; best_j=j
+                    else: p[i],p[j] = p[j].copy(),p[i].copy()
+                else: p[i],p[j] = p[j].copy(),p[i].copy()
+            if best_j >= 0: improved+=1
         if improved == 0: break
     return p
 
@@ -509,67 +483,63 @@ def _swap_refine(pos, movable, sizes, ni, canvas_w, canvas_h,
 # Mini SA
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _mini_sa(pos, movable, sizes, ni, canvas_w, canvas_h, gap=0.003, time_budget=3.0):
-    t0 = time.time(); n = len(pos)
+def _mini_sa(pos, movable, sizes, ni, canvas_w, canvas_h,
+             t_start, time_budget, gap=0.003):
+    n = len(pos)
     hw = sizes[:,0]/2; hh = sizes[:,1]/2
     sep_x = (sizes[:,0:1]+sizes[:,0].reshape(1,n))/2.0
     sep_y = (sizes[:,1:2]+sizes[:,1].reshape(1,n))/2.0
     movable_idx = np.where(movable)[0]
     diag = math.sqrt(canvas_w**2+canvas_h**2)
-    T0 = 0.005*diag; T1 = 0.0002*diag
+    T0v = 0.005*diag; T1v = 0.0002*diag
+    deadline = t_start + time_budget
     p = pos.copy()
 
-    while True:
-        el = time.time()-t0
-        if el >= time_budget: break
-        frac = el/time_budget
-        T = T0*math.exp(math.log(T1/T0)*frac); step = T*1.5
+    while time.time() < deadline:
+        el = time.time()-t_start; frac = min(1.0, el/time_budget)
+        T = T0v*math.exp(math.log(T1v/T0v)*frac); step = T*1.5
         i = int(np.random.choice(movable_idx))
         orig = p[i].copy()
         nx = float(np.clip(orig[0]+np.random.uniform(-step,step), hw[i], canvas_w-hw[i]))
         ny = float(np.clip(orig[1]+np.random.uniform(-step,step), hh[i], canvas_h-hh[i]))
-        placed = np.ones(n, dtype=bool); placed[i]=False
-        ddx = np.abs(nx-p[:,0]); ddy = np.abs(ny-p[:,1])
-        if ((ddx<sep_x[i]+gap)&(ddy<sep_y[i]+gap)&placed).any():
-            continue
-        wl_b = ni.hpwl_node(p, i); p[i]=[nx,ny]; wl_a = ni.hpwl_node(p, i)
-        delta = wl_a-wl_b
-        if delta > 0 and np.random.random() >= math.exp(-delta/(T+1e-12)):
-            p[i] = orig
+        placed=np.ones(n,dtype=bool); placed[i]=False
+        ddx=np.abs(nx-p[:,0]); ddy=np.abs(ny-p[:,1])
+        if ((ddx<sep_x[i]+gap)&(ddy<sep_y[i]+gap)&placed).any(): continue
+        wl_b=ni.hpwl_node(p,i); p[i]=[nx,ny]; wl_a=ni.hpwl_node(p,i)
+        delta=wl_a-wl_b
+        if delta>0 and np.random.random()>=math.exp(-delta/(T+1e-12)): p[i]=orig
     return p
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Overlap repair — final safety pass (should never trigger but just in case)
+# Overlap repair — final safety
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _repair_overlaps(pos, movable, sizes, canvas_w, canvas_h, gap=0.003):
-    """Brute-force overlap repair as final safety check."""
     n = len(pos)
     hw = sizes[:,0]/2; hh = sizes[:,1]/2
     sep_x = (sizes[:,0:1]+sizes[:,0].reshape(1,n))/2.0
     sep_y = (sizes[:,1:2]+sizes[:,1].reshape(1,n))/2.0
     p = pos.copy()
-
-    for _ in range(10):  # max 10 repair passes
-        had_overlap = False
+    for _ in range(20):
+        had = False
         for i in range(n):
             if not movable[i]: continue
             for j in range(i+1, n):
-                dx = abs(p[i,0]-p[j,0]); dy = abs(p[i,1]-p[j,1])
-                if dx < sep_x[i,j]+gap and dy < sep_y[i,j]+gap:
-                    had_overlap = True
-                    # Push i away from j
-                    push_x = (sep_x[i,j]+gap - dx + 1e-4) * np.sign(p[i,0]-p[j,0]+1e-10)
-                    push_y = (sep_y[i,j]+gap - dy + 1e-4) * np.sign(p[i,1]-p[j,1]+1e-10)
-                    if movable[i]:
-                        p[i,0] = np.clip(p[i,0]+push_x*0.5, hw[i], canvas_w-hw[i])
-                        p[i,1] = np.clip(p[i,1]+push_y*0.5, hh[i], canvas_h-hh[i])
-                    if movable[j]:
-                        p[j,0] = np.clip(p[j,0]-push_x*0.5, hw[j], canvas_w-hw[j])
-                        p[j,1] = np.clip(p[j,1]-push_y*0.5, hh[j], canvas_h-hh[j])
-        if not had_overlap:
-            break
+                ox = sep_x[i,j]+gap - abs(p[i,0]-p[j,0])
+                oy = sep_y[i,j]+gap - abs(p[i,1]-p[j,1])
+                if ox > 0 and oy > 0:
+                    had = True
+                    # push along smaller overlap axis
+                    if ox < oy:
+                        push = (ox/2+1e-4)*np.sign(p[i,0]-p[j,0]+1e-10)
+                        if movable[i]: p[i,0]=np.clip(p[i,0]+push, hw[i], canvas_w-hw[i])
+                        if movable[j]: p[j,0]=np.clip(p[j,0]-push, hw[j], canvas_w-hw[j])
+                    else:
+                        push = (oy/2+1e-4)*np.sign(p[i,1]-p[j,1]+1e-10)
+                        if movable[i]: p[i,1]=np.clip(p[i,1]+push, hh[i], canvas_h-hh[i])
+                        if movable[j]: p[j,1]=np.clip(p[j,1]-push, hh[j], canvas_h-hh[j])
+        if not had: break
     return p
 
 
@@ -579,23 +549,24 @@ def _repair_overlaps(pos, movable, sizes, canvas_w, canvas_h, gap=0.003):
 
 class Mj97Placer:
     """
-    MJ97 v9: Grid-aligned GP + two-phase placement + fast congestion escape.
+    MJ97 v10: Vectorized numpy WA gradient + strict deadline control.
 
-    Pipeline (target: 50s per benchmark):
-      1. GP phase 1 — 18s, density target 0.65, grid-aligned
-      2. Legalization — spiral, guaranteed zero overlaps
-      3. GP phase 2 — 8s, tight density target 0.5, re-spread after legalization
-      4. Legalization again — fast (most already legal)
-      5. Congestion escape — 8s, fast RUDY-guided numpy moves
-      6. Swap refinement — 5s
-      7. Mini SA — 3s
-      8. Overlap repair — safety pass
+    Pipeline (hard cap: 50s):
+      t=0    Load + net extraction
+      t=~2   GP phase 1: 20s (vectorized, density_target=0.65, grid-aligned)
+      t=~22  Legalize 1
+      t=~25  GP phase 2: 8s (re-spread from legalized, target=0.5)
+      t=~33  Legalize 2
+      t=~36  Congestion escape: 6s (RUDY-guided numpy)
+      t=~42  Swap refine: 5s
+      t=~47  Mini SA: 2s
+      t=~49  Overlap repair
     """
 
     def __init__(self, seed: int = 97):
         self.seed = seed
 
-    def place(self, benchmark: Benchmark) -> torch.Tensor:
+    def place(self, benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
         np.random.seed(self.seed)
         random.seed(self.seed)
@@ -612,10 +583,8 @@ class Mj97Placer:
         movable = benchmark.get_movable_mask()[:n_hard].cpu().numpy()
         cw = float(benchmark.canvas_width)
         ch = float(benchmark.canvas_height)
-
-        # Use actual evaluation grid — critical for ibm02/06/etc
-        R = int(benchmark.grid_rows)
-        C = int(benchmark.grid_cols)
+        R  = int(benchmark.grid_rows)
+        C  = int(benchmark.grid_cols)
 
         plc  = _load_plc(benchmark)
         nets = _extract_nets(benchmark, plc) if plc is not None else []
@@ -627,65 +596,68 @@ class Mj97Placer:
 
         ni = NetIndex(nets, n_hard)
 
-        def remaining(budget_from_start):
-            return max(0.0, min(budget_from_start, HARD_CAP) - (time.time()-T0))
+        def rem(target_elapsed):
+            """Seconds remaining before target_elapsed or HARD_CAP."""
+            used = time.time()-T0
+            return max(0.0, min(target_elapsed, HARD_CAP) - used)
 
-        # ── 1. GP phase 1: 18s, aggressive spreading (target=0.65)
+        # ── 1. GP phase 1: 20s, aggressive spreading
         gp1 = _global_place(
             init=init.copy(), movable=movable, sizes=sizes, ni=ni,
             canvas_w=cw, canvas_h=ch, R=R, C=C,
-            time_budget=remaining(18.0), seed=self.seed,
-            density_target=0.65, lam_max=5.0,
+            t_start=T0, time_budget=rem(20.0),
+            seed=self.seed, density_target=0.65,
+            lam0=5e-4, lam_max=5.0,
         )
 
-        # ── 2. Legalization 1
-        legal1 = _legalize(gp1, movable, sizes, cw, ch, gap=0.003)
+        # ── 2. Legalize 1
+        legal = _legalize(gp1, movable, sizes, cw, ch, gap=0.003)
 
-        # ── 3. GP phase 2: 8s, very tight density to re-spread after legalization
-        #    Start from legalized positions, much tighter target forces more spreading
-        gp2_budget = remaining(32.0)
+        # ── 3. GP phase 2: re-spread from legalized positions
+        gp2_budget = rem(33.0)
         if gp2_budget > 2.0:
             gp2 = _global_place(
-                init=legal1.copy(), movable=movable, sizes=sizes, ni=ni,
+                init=legal.copy(), movable=movable, sizes=sizes, ni=ni,
                 canvas_w=cw, canvas_h=ch, R=R, C=C,
-                time_budget=gp2_budget, seed=self.seed+1,
-                density_target=0.5, lam0=1e-2, lam_max=3.0,
+                t_start=T0, time_budget=gp2_budget,
+                seed=self.seed+1, density_target=0.5,
+                lam0=1e-2, lam_max=3.0,
                 gamma0_frac=0.02, gamma_min_frac=0.001,
             )
-            # ── 4. Legalization 2
-            legal2 = _legalize(gp2, movable, sizes, cw, ch, gap=0.003)
-        else:
-            legal2 = legal1
+            legal = _legalize(gp2, movable, sizes, cw, ch, gap=0.003)
 
-        # ── 5. Congestion escape: 8s, fast RUDY-guided
-        cong_budget = remaining(45.0)
+        # ── 4. Congestion escape: 6s
+        cong_budget = rem(42.0)
         if cong_budget > 1.0:
-            legal2 = _congestion_escape(
-                pos=legal2, movable=movable, sizes=sizes, ni=ni,
+            legal = _congestion_escape(
+                pos=legal, movable=movable, sizes=sizes, ni=ni,
                 canvas_w=cw, canvas_h=ch, R=R, C=C,
-                gap=0.003, time_budget=cong_budget, radius=4,
+                t_start=T0, time_budget=cong_budget,
+                gap=0.003, radius=4,
             )
 
-        # ── 6. Swap refinement: 5s
-        swap_budget = remaining(50.0)
+        # ── 5. Swap refine: 5s
+        swap_budget = rem(47.0)
         if swap_budget > 1.0:
-            legal2 = _swap_refine(
-                pos=legal2, movable=movable, sizes=sizes, ni=ni,
-                canvas_w=cw, canvas_h=ch, gap=0.003,
-                n_passes=6, time_budget=swap_budget, k=12,
+            legal = _swap_refine(
+                pos=legal, movable=movable, sizes=sizes, ni=ni,
+                canvas_w=cw, canvas_h=ch,
+                t_start=T0, time_budget=swap_budget,
+                gap=0.003, k=12,
             )
 
-        # ── 7. Mini SA: 3s
-        sa_budget = remaining(53.0)
+        # ── 6. Mini SA: 2s
+        sa_budget = rem(49.0)
         if sa_budget > 0.5:
-            legal2 = _mini_sa(
-                pos=legal2, movable=movable, sizes=sizes, ni=ni,
-                canvas_w=cw, canvas_h=ch, gap=0.003,
-                time_budget=sa_budget,
+            legal = _mini_sa(
+                pos=legal, movable=movable, sizes=sizes, ni=ni,
+                canvas_w=cw, canvas_h=ch,
+                t_start=T0, time_budget=sa_budget,
+                gap=0.003,
             )
 
-        # ── 8. Safety overlap repair (should be a no-op if legalizer worked)
-        legal2 = _repair_overlaps(legal2, movable, sizes, cw, ch, gap=0.003)
+        # ── 7. Safety overlap repair
+        legal = _repair_overlaps(legal, movable, sizes, cw, ch, gap=0.003)
 
-        out[:n_hard] = torch.from_numpy(legal2).float()
+        out[:n_hard] = torch.from_numpy(legal).float()
         return out

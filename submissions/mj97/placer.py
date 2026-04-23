@@ -1,12 +1,8 @@
 """
-MJ97 Placer - Aggressive ePlace-Lite style legalizer.
+MJ97 Placer - Minimal displacement legalizer.
 
-Keeps the strong initial analytical placement and performs a very
-small-displacement hard-macro legalization pass.
-
-Usage:
-    uv run evaluate submissions/mj97/placer.py
-    uv run evaluate submissions/mj97/placer.py --all
+This version preserves the strong analytical initial placement while enforcing
+strict hard-macro legality with very small displacement.
 """
 
 import random
@@ -18,7 +14,7 @@ from macro_place.benchmark import Benchmark
 
 
 class Mj97Placer:
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 97):
         self.seed = seed
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
@@ -30,8 +26,8 @@ class Mj97Placer:
         if n_hard == 0:
             return benchmark.macro_positions.clone()
 
-        placement = benchmark.macro_positions.clone()
-        pos = placement[:n_hard].cpu().numpy().astype(np.float64).copy()
+        out = benchmark.macro_positions.clone()
+        init = benchmark.macro_positions[:n_hard].cpu().numpy().astype(np.float64)
         sizes = benchmark.macro_sizes[:n_hard].cpu().numpy().astype(np.float64)
         half_w = sizes[:, 0] * 0.5
         half_h = sizes[:, 1] * 0.5
@@ -39,39 +35,41 @@ class Mj97Placer:
         canvas_w = float(benchmark.canvas_width)
         canvas_h = float(benchmark.canvas_height)
 
-        pos = self._legalize_min_displacement(
-            pos,
+        legal = self._legalize(
+            init,
             movable,
             sizes,
             half_w,
             half_h,
             canvas_w,
             canvas_h,
+            gap=0.0008,
+            step_mul=0.18,
+            max_radius=240,
         )
 
-        placement[:n_hard] = torch.from_numpy(pos).to(dtype=torch.float32)
-        return placement
+        out[:n_hard] = torch.from_numpy(legal).to(dtype=torch.float32)
+        return out
 
-    def _legalize_min_displacement(
+    def _legalize(
         self,
-        pos: np.ndarray,
+        init: np.ndarray,
         movable: np.ndarray,
         sizes: np.ndarray,
         half_w: np.ndarray,
         half_h: np.ndarray,
         canvas_w: float,
         canvas_h: float,
+        gap: float,
+        step_mul: float,
+        max_radius: int,
     ) -> np.ndarray:
-        n = pos.shape[0]
+        n = init.shape[0]
         sep_x = (sizes[:, 0:1] + sizes[:, 0:1].T) / 2.0
         sep_y = (sizes[:, 1:2] + sizes[:, 1:2].T) / 2.0
-
         order = sorted(range(n), key=lambda i: -(sizes[i, 0] * sizes[i, 1]))
         placed = np.zeros(n, dtype=bool)
-        legal = pos.copy()
-        gap = 0.001
-        step_mul = 0.20
-        max_radius = 220
+        legal = init.copy()
 
         for idx in order:
             if not movable[idx]:
@@ -98,20 +96,20 @@ class Mj97Placer:
                         if abs(dxm) != radius and abs(dym) != radius:
                             continue
 
-                        cand_x = np.clip(
-                            pos[idx, 0] + dxm * step,
+                        cx = np.clip(
+                            init[idx, 0] + dxm * step,
                             half_w[idx],
                             canvas_w - half_w[idx],
                         )
-                        cand_y = np.clip(
-                            pos[idx, 1] + dym * step,
+                        cy = np.clip(
+                            init[idx, 1] + dym * step,
                             half_h[idx],
                             canvas_h - half_h[idx],
                         )
 
                         if placed.any():
-                            dx = np.abs(cand_x - legal[:, 0])
-                            dy = np.abs(cand_y - legal[:, 1])
+                            dx = np.abs(cx - legal[:, 0])
+                            dy = np.abs(cy - legal[:, 1])
                             coll = (
                                 (dx < sep_x[idx] + gap)
                                 & (dy < sep_y[idx] + gap)
@@ -121,10 +119,10 @@ class Mj97Placer:
                             if coll.any():
                                 continue
 
-                        dist = (cand_x - pos[idx, 0]) ** 2 + (cand_y - pos[idx, 1]) ** 2
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_pos = np.array([cand_x, cand_y], dtype=np.float64)
+                        d = (cx - init[idx, 0]) ** 2 + (cy - init[idx, 1]) ** 2
+                        if d < best_dist:
+                            best_dist = d
+                            best_pos = np.array([cx, cy], dtype=np.float64)
                             found = True
 
                 if found:

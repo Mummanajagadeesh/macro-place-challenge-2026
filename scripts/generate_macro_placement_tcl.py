@@ -428,21 +428,25 @@ dict for {prefix entries} $_odb_groups {
         if direct_placements:
             f.write("# Direct placements\n")
             f.write("set block [ord::get_db_block]\n" if not group_data else "")
-            f.write("# Build name lookup: try both \\[N\\] (Genus) and plain [N] forms\n")
-            f.write("proc _find_macro {block name} {\n")
-            f.write("    # Try with escaped brackets (Genus netlist ODB names)\n")
-            f.write("    set escaped [string map {[ {\\[} ] {\\]}} $name]\n")
-            f.write("    set inst [$block findInst $escaped]\n")
-            f.write("    if {$inst ne \"NULL\"} { return $inst }\n")
-            f.write("    # Try plain name\n")
-            f.write("    set inst [$block findInst $name]\n")
-            f.write("    return $inst\n")
+            f.write("# Try multiple name forms to find each macro instance\n")
+            f.write("proc _find_macro {block args} {\n")
+            f.write("    foreach name $args {\n")
+            f.write("        set inst [$block findInst $name]\n")
+            f.write("        if {$inst ne \"NULL\"} { return $inst }\n")
+            f.write("    }\n")
+            f.write("    return NULL\n")
             f.write("}\n\n")
             for odb_name, x_ll, y_ll, orient, plc_name in direct_placements:
-                # Pass raw name to _find_macro which handles escaping in TCL
-                tcl_name = odb_name.replace('\\', '\\\\').replace('[', '\\[').replace(']', '\\]').replace('"', '\\"')
+                # Try: 1) converted ODB name, 2) with escaped brackets, 3) raw plc name
+                candidates = [odb_name]
+                if plc_name != odb_name:
+                    # Also try escaped-bracket version for Genus netlists
+                    escaped = plc_name.replace('[', '\\[').replace(']', '\\]')
+                    candidates.append(escaped)
+                    candidates.append(plc_name)
+                tcl_args = ' '.join(f'"{c}"' for c in candidates)
                 f.write(f'# {plc_name}\n')
-                f.write(f'set _inst [_find_macro $block "{tcl_name}"]\n')
+                f.write(f'set _inst [_find_macro $block {tcl_args}]\n')
                 f.write(f'if {{$_inst ne "NULL"}} {{\n')
                 # Use the inst object directly to place — avoids name escaping issues
                 # Snap to manufacturing grid (10 DBU) to avoid DRT-0416 offgrid errors

@@ -234,8 +234,9 @@ def write_orfs_macro_placement(placement, benchmark, plc, output_file, core_area
         orientation = node.get_orientation() if node.get_orientation() else "R0"
 
         if use_genus_names:
-            # Genus netlists preserve original hierarchy — use .plc name directly
-            direct_placements.append((plc_name, x_ll, y_ll, orientation, plc_name))
+            # ODB always flattens to underscores regardless of netlist source
+            odb_name = _plc_to_odb_name(plc_name)
+            direct_placements.append((odb_name, x_ll, y_ll, orientation, plc_name))
             total_macros += 1
         else:
             group_prefix, macro_k = _plc_extract_group_and_index(plc_name)

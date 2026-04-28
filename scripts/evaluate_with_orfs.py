@@ -26,7 +26,7 @@ import torch
 from pathlib import Path
 
 # Memory limit for ORFS subprocesses (64 GB)
-MEMORY_LIMIT_BYTES = 64 * 1024 * 1024 * 1024
+MEMORY_LIMIT_BYTES = 100 * 1024 * 1024 * 1024  # 100GB for rtl_macro_placer
 
 def _set_memory_limit():
     """Pre-exec hook: cap virtual memory for the child process tree."""
@@ -40,7 +40,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from benchmark import Benchmark
 from loader import load_benchmark_from_dir
 from objective import compute_proxy_cost
-from orfs_integration.design_generator import create_orfs_design, ORFSDesign
+try:
+    from orfs_integration.design_generator import create_orfs_design, ORFSDesign
+except ImportError:
+    create_orfs_design = None  # Only needed for fallback config generation
 from generate_macro_placement_tcl import write_orfs_macro_placement
 
 
@@ -102,6 +105,7 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
         cmd = [
             "make",
             f"DESIGN_CONFIG=./designs/{tech}/{design_name}/config.mk",
+            "OPENROAD_ARGS=-threads 16",
             "finish"
         ]
         # Help ORFS find system-installed tools when not using Nix or Docker
@@ -127,7 +131,7 @@ def run_orfs_flow(design_dir: Path, orfs_root: Path, use_docker: bool = True, sk
                 cwd=flow_dir,
                 stdout=fout,
                 stderr=ferr,
-                timeout=21600,  # 6 hour timeout
+                timeout=43200,  # 12 hour timeout
                 preexec_fn=_set_memory_limit,
             )
         except subprocess.TimeoutExpired:
@@ -433,15 +437,42 @@ set_output_delay -clock core_clock 0 [all_outputs]
                     with open(candidate) as fv:
                         n_sram = sum(1 for line in fv if "fakeram45_" in line)
                     if n_sram > 0:
-                        abs_path = candidate.resolve()
+                        # Copy Genus netlist to design dir so we can patch it
+                        patched_netlist = design_dir / "genus_netlist.v"
+                        shutil.copy(candidate, patched_netlist)
+
+                        # Fix Genus netlist syntax: join split "module\n  name" declarations
+                        # OpenROAD's Verilog reader can't handle module name on next line
+                        genus_raw = patched_netlist.read_text()
+                        genus_raw = re.sub(r'^module\s*\n\s+', 'module ', genus_raw, flags=re.MULTILINE)
+                        patched_netlist.write_text(genus_raw)
+
+                        # Patch: add missing gate-level module definitions (issue #65).
+                        # Genus netlist references lzc_MODE1_WIDTH64, lzc_WIDTH3, lzc_WIDTH4
+                        # but their definitions were stripped. Use pre-synthesized gate-level patches.
+                        lzc_patch_file = Path(__file__).parent / "ariane133_lzc_patches.v"
+                        if lzc_patch_file.exists():
+                            genus_text = patched_netlist.read_text()
+                            patch_text = lzc_patch_file.read_text()
+                            # Only append modules that are referenced but not defined
+                            needed = [m for m in ['lzc_MODE1_WIDTH64', 'lzc_WIDTH3', 'lzc_WIDTH4']
+                                      if m in genus_text and f"module {m}" not in genus_text]
+                            if needed:
+                                with open(patched_netlist, 'a') as pf:
+                                    pf.write(f"\n// --- Gate-level patches for {', '.join(needed)} ---\n")
+                                    pf.write(patch_text)
+                                print(f"  ✓ Patched {len(needed)} missing modules: {', '.join(needed)}")
+
                         config_content += (
-                            f"\n# Override: use Genus-mapped gate netlist ({n_sram} SRAMs)\n"
-                            f"export SYNTH_NETLIST_FILES = {abs_path}\n"
+                            f"\n# Override: use patched Genus gate netlist ({n_sram} SRAMs)\n"
+                            f"export SYNTH_NETLIST_FILES = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/genus_netlist.v\n"
                         )
-                        # Remove stale Yosys cache so ORFS uses the Genus netlist
-                        stale_yosys = orfs_root / "flow" / "results" / tech / source_name / "base" / "1_2_yosys.v"
-                        if stale_yosys.is_file():
-                            stale_yosys.unlink()
+                        # Pre-place the patched Genus netlist where ORFS expects 1_2_yosys.v.
+                        # This bypasses Yosys entirely — the Makefile sees the output
+                        # already exists and skips the canonicalize + synthesis steps.
+                        yosys_out = orfs_root / "flow" / "results" / tech / source_name / "base"
+                        yosys_out.mkdir(parents=True, exist_ok=True)
+                        shutil.copy(patched_netlist, yosys_out / "1_2_yosys.v")
                         _using_genus_netlist = True
                         print(f"  ✓ Using Genus gate netlist: {candidate.name} ({n_sram} SRAMs)")
                         break
@@ -537,6 +568,25 @@ set_output_delay -clock core_clock 0 [all_outputs]
             # Add MACRO_PLACEMENT_TCL for ALL designs so ORFS uses our placement
             if 'MACRO_PLACEMENT_TCL' not in config_content:
                 config_content += '\nexport MACRO_PLACEMENT_TCL = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/macros.tcl\n'
+
+            # Fix Genus netlist issue: constant-1 nets typed as POWER can't be routed.
+            # Reclassify them as SIGNAL before global routing.
+            if _using_genus_netlist:
+                fix_tcl = design_dir / "fix_power_nets.tcl"
+                fix_tcl.write_text(
+                    "# Reclassify constant nets mistyped as POWER/GROUND\n"
+                    "set block [ord::get_db_block]\n"
+                    "foreach net [$block getNets] {\n"
+                    "  set type [$net getSigType]\n"
+                    "  set name [$net getName]\n"
+                    "  if { ($type eq \"POWER\" || $type eq \"GROUND\") && $name ni {VDD VSS} } {\n"
+                    "    $net setSigType SIGNAL\n"
+                    "    puts \"Reclassified net $name from $type to SIGNAL\"\n"
+                    "  }\n"
+                    "}\n"
+                )
+                config_content += f'\nexport PRE_GLOBAL_ROUTE_TCL = ./designs/$(PLATFORM)/$(DESIGN_NICKNAME)/fix_power_nets.tcl\n'
+                print(f"  ✓ Added PRE_GLOBAL_ROUTE_TCL to fix Genus power net typing")
 
             # Workaround: repair_timing -sequence is not supported in older OpenROAD builds.
             # Set REMOVE_ABC_BUFFERS=1 so floorplan.tcl takes the remove_buffers path

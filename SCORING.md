@@ -1,14 +1,6 @@
 # Macro Placement Challenge — Grand Prize Scoring Rules (v2.0)
 
-This document defines the **deterministic, rules-based evaluation system** for the Grand Prize ($20,000).
-
-The goal is simple:
-- No ambiguity
-- No post-hoc decisions
-
-All submissions are evaluated using **mechanical scoring rules** applied to outputs from a shared evaluation pipeline.
-
----
+This document defines the evaluation system for the Grand Prize ($20,000).
 
 ## Overview
 
@@ -66,6 +58,34 @@ TNS_sub ≥ min(TNS_SA, TNS_RP)
 
 ---
 
+## Handling ORFS Failures
+
+If OpenROAD fails on any design (exits non-zero before producing WNS/TNS/Area),
+the submission is technically disqualified from the Grand Prize. In practice,
+we will reach out and work with the team to resolve the failure — whether the
+cause is on our side (evaluator bug, netlist issue) or on the placer's side
+(a placement choice ORFS can't route through).
+
+The evaluator auto-handles the following on behalf of placers:
+- Snap macro positions to the manufacturing grid
+- Iteratively push macros apart to maintain ≥12 μm clearance (PDN channel
+  routing needs ~10 μm between adjacent macros). This happens **only at
+  Tier 2**, after scaling the placement to ORFS core coordinates; Tier 1
+  proxy cost uses your submitted coordinates unchanged. The pre- and
+  post-push coordinates are logged to a sidecar `macros.tcl.spacing_diff.txt`
+  in the ORFS results directory so you can see exactly what was moved and
+  by how much. To keep full control over Tier 2 coordinates, leave ≥12 μm
+  between macros in your submitted placement.
+- Instance name escaping for Genus netlists
+
+The placer is responsible for: zero overlaps, staying within canvas bounds,
+macro orientation choices, and any other decisions that affect downstream
+ORFS routability.
+
+Tier 1 (Proxy Prize) ranking is unaffected by Tier 2 / ORFS outcomes.
+
+---
+
 ## Stage 2 — Scoring (Geometric Mean of Ratios)
 
 All feasible submissions are ranked using a **single scalar score** computed from improvement ratios. This approach:
@@ -89,9 +109,9 @@ Area_avg = (Area_SA + Area_RP) / 2
 For each design:
 
 ```
-R_WNS  = WNS_sub  / WNS_avg       (both values are negative; ratio > 1 means better)
-R_TNS  = TNS_sub  / TNS_avg       (both values are negative; ratio > 1 means better)
-R_Area = Area_avg / Area_sub      (lower area is better, so invert)
+R_WNS  = WNS_avg  / WNS_sub       (both negative; less-negative numerator is the baseline, so ratio > 1 means submission is better)
+R_TNS  = TNS_avg  / TNS_sub       (both negative; ratio > 1 means submission is better)
+R_Area = Area_avg / Area_sub      (lower area is better, so avg over sub; ratio > 1 means submission is smaller)
 ```
 
 ### Step 3 — Compute Per-Design Score
@@ -130,24 +150,9 @@ Suppose for `ariane133`:
 - Submission: WNS = -0.8 ns, TNS = -6,000 ns, Area = 4,000,000 μm²
 
 ```
-R_WNS  = -0.8 / -1.3 = 0.615   → less negative = better, but ratio < 1?
-```
-
-**Wait — important note on WNS/TNS ratio interpretation:**
-
-Since WNS and TNS are negative values (slack violations), a *less negative* value is better. When dividing two negative numbers, a less negative numerator (better) over a more negative denominator gives a ratio **less than 1**. To make the ratio intuitive (> 1 = better):
-
-```
-R_WNS  = WNS_avg / WNS_sub       (flipped: avg over submission)
-R_TNS  = TNS_avg / TNS_sub       (flipped: avg over submission)
-R_Area = Area_avg / Area_sub     (avg over submission)
-```
-
-Corrected example:
-```
-R_WNS  = -1.3 / -0.8  = 1.625   (62.5% better WNS)
-R_TNS  = -10000 / -6000 = 1.667  (66.7% better TNS)
-R_Area = 4200000 / 4000000 = 1.05 (5% smaller area)
+R_WNS  = -1.3    / -0.8     = 1.625   (62.5% better WNS)
+R_TNS  = -10000  / -6000    = 1.667   (66.7% better TNS)
+R_Area = 4200000 / 4000000  = 1.050   (5% smaller area)
 
 Design_Score = (1.625^3 × 1.667^2 × 1.05^1) ^ (1/6)
              = (4.291 × 2.779 × 1.05) ^ (1/6)
